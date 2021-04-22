@@ -1,5 +1,4 @@
 #include <MPU9250_WE.h>
-#include <CircularBuffer.h>
 #include <Wire.h>
 
 #define MPU_INTERRUPT_PIN 3
@@ -16,16 +15,15 @@
 #define MOTOR_RIGHT_MS2 A2
 #define MOTOR_RIGHT_MS3 A3
 
-#define MOTOR_CONTROL_FREQUENCY 50000
+#define POT_PIN A6
+
+#define MOTOR_CONTROL_FREQUENCY 40000
 #define SAMPLE_SIZE 3
 #define PITCH_MEDIAN_INDEX SAMPLE_SIZE / 2
 
-#define KP 1
-#define KI 0
-#define KD 0
+#define MAX_DEGREE_SECOND_CHANGE 45
 
 MPU9250_WE myMPU9250 = MPU9250_WE(0x68);
-CircularBuffer<float, SAMPLE_SIZE> pitchSampleBuffer;
 
 int samplingIndex = 0;
 float pitchSamples[SAMPLE_SIZE];
@@ -38,7 +36,7 @@ unsigned long motorRightTiming = 18;
 unsigned long leftMotorTickCounter = 0;
 unsigned long rightMotorTickCounter = 0;
 
-unsigned short stepDeviderRanges[5] = {125, 95, 80, 40, 0};
+unsigned short stepDeviderRanges[5] = {150, 120, 80, 40, 0};
 int step_divider = 16;
 
 void setup() {
@@ -73,21 +71,19 @@ void setup_MPU() {
   }
 
 
-  myMPU9250.setSampleRateDivider(2);
+//  myMPU9250.setSampleRateDivider(1);
   
   myMPU9250.enableGyrDLPF();
-  myMPU9250.setGyrDLPF(MPU9250_DLPF_5);
+  myMPU9250.setGyrDLPF(MPU9250_DLPF_6);
 
   myMPU9250.setAccRange(MPU9250_ACC_RANGE_2G);
   myMPU9250.enableAccDLPF(true);
-  myMPU9250.setAccDLPF(MPU9250_DLPF_5);
+  myMPU9250.setAccDLPF(MPU9250_DLPF_6);
   
   myMPU9250.setIntPinPolarity(MPU9250_ACT_HIGH); 
   myMPU9250.enableIntLatch(false);
   myMPU9250.enableInterrupt(MPU9250_DATA_READY);  
 
-  
-  
   attachInterrupt(digitalPinToInterrupt(MPU_INTERRUPT_PIN), dataReadyISR, RISING);
 }
 
@@ -104,72 +100,96 @@ void setup_INTERRUPTS() {
   OCR1A = 16000000 / MOTOR_CONTROL_FREQUENCY;
 }
 
-bool enabled = false;
+double errorPrior = 0;
+double integral = 0;
 unsigned long timestamp = 0;
 void loop() {  
+  float pot = analogRead(A6) / 1024.0;
+  
   if(pitchDataReady) {
     pitchDataReady = false;
-
-    byte index = (samplingIndex++) % SAMPLE_SIZE;
-    if (index == 0) {enabled = true;}
-
-    float sampledPitch = myMPU9250.getPitch();
-    float sampledAcceleration = myMPU9250.getGyrValues().y;
-    pitchSamples[samplingIndex] = sampledPitch;
-    accelerationSamples[samplingIndex] = sampledAcceleration;
-    samplingIndex = (samplingIndex + 1) % SAMPLE_SIZE;
     
-    if (enabled) {
-      float pitch = readPitch();
-      float acceleration = readAcceleration();
+    double secondsPassed = ((micros() - timestamp) / 1000.0) / 1000.0;
+    timestamp = micros();
 
-      float pitchABS = abs(pitch);
-      float uprightAdjustment = ((pitchABS * pow(pitchABS, -0.5)) / (90 * pow(90, -0.5))) * 60;
-      uprightAdjustment = (pitch < 0) ? -uprightAdjustment : uprightAdjustment;
+    float measuredPitch = myMPU9250.getPitch() + 6;
+    float measuredAcceleration = myMPU9250.getGyrValues().y;
+
+//    pitchSamples[samplingIndex] = isnan(measuredPitch) ? 0 : measuredPitch;
+//    accelerationSamples[samplingIndex] = isnan(measuredAcceleration) ? 0 : measuredAcceleration;
+//    samplingIndex = (samplingIndex + 1) % SAMPLE_SIZE;
+
+    double pitch = readPitch(measuredPitch, secondsPassed);
+    double acceleration = readAcceleration(measuredAcceleration, secondsPassed);
       
-      float accelerationAdjustment = max(-30, min(-acceleration, 30));
-      float targetRPM = historyRPM * 0.8 + (accelerationAdjustment + uprightAdjustment) * 0.2;
-      if (isnan(targetRPM)){
-        return;
-      }
-      Serial.println(targetRPM);
+    double currentPosition = acceleration*1.5 - pitch;
 
-      historyRPM = targetRPM;
+    double error = 0 - currentPosition;
+    integral = min(integral + error * secondsPassed, 50);
+    double derivative = (error - errorPrior) / secondsPassed;
+    errorPrior = error;
 
-      setMotorLeftRPM(targetRPM);
-      setMotorRightRPM(targetRPM);
+    //             P           I               D
+    float pidOut = 4*error + 1*integral + 0.02*derivative;
 
-    }
+    Serial.print(pidOut);
+    Serial.print(" ");
+    Serial.println(currentPosition);
+//    Serial.print(" ");
+//    Serial.println((pot/10.0)*derivative);
+
+    setMotorLeftRPM(pidOut);
+    setMotorRightRPM(pidOut);
   }
 }
 
-float readPitch() {  
-  float samples_CPY[SAMPLE_SIZE];
+double lastPitchReading = 0;
+double readPitch(float pitch, double secondsPassed) {  
+//  float samples_CPY[SAMPLE_SIZE];
   
-  memcpy(samples_CPY, pitchSamples, sizeof(float) * SAMPLE_SIZE);
-  qsort(samples_CPY, SAMPLE_SIZE, sizeof(float), compare_floats); 
+//  memcpy(samples_CPY, pitchSamples, sizeof(float) * SAMPLE_SIZE);
+//  qsort(samples_CPY, SAMPLE_SIZE, sizeof(float), compare_floats); 
+
+//  float medianPitch = samples_CPY[PITCH_MEDIAN_INDEX];
+  double difference = pitch - lastPitchReading;
+  double changeAllowed = MAX_DEGREE_SECOND_CHANGE * secondsPassed;
   
-  return samples_CPY[PITCH_MEDIAN_INDEX];
+  double newPitchLimited = lastPitchReading + max(-changeAllowed, min(difference, changeAllowed));
+//  float newPitchSmoothed = lastPitchReading * 0.7 + newPitchLimited * 0.3;
+  
+  lastPitchReading = newPitchLimited;
+  
+  return newPitchLimited;
 }
 
-float readAcceleration() {
-  float samples_CPY[SAMPLE_SIZE];
+double lastAccReading = 0;
+double readAcceleration(float accel, double secondsPassed) {
+//  float samples_CPY[SAMPLE_SIZE];
   
-  memcpy(samples_CPY, accelerationSamples, sizeof(float) * SAMPLE_SIZE);
-  qsort(samples_CPY, SAMPLE_SIZE, sizeof(float), compare_floats); 
+//  memcpy(samples_CPY, accelerationSamples, sizeof(float) * SAMPLE_SIZE);
+//  qsort(samples_CPY, SAMPLE_SIZE, sizeof(float), compare_floats); 
+
+//  float medianAcc = samples_CPY[PITCH_MEDIAN_INDEX];
+  double difference = accel - lastAccReading;
+  double changeAllowed = MAX_DEGREE_SECOND_CHANGE * secondsPassed;
+
+  double newAccLimited = lastAccReading + max(-changeAllowed, min(difference, changeAllowed));
+//  float newAccSmoothed = lastAccReading * 0.7 + newAccLimited * 0.3;
+
+  lastAccReading = newAccLimited;
   
-  return samples_CPY[PITCH_MEDIAN_INDEX];
+  return newAccLimited;
 }
 
 unsigned long motorLeftDebounceTimestamp = 0;
 bool leftDir = false;
 void setMotorLeftRPM(float RPM) {
-  float absRPM = abs(RPM);
+  float absRPM = min(abs(RPM), 150);
   
   //DIRECTION
   bool dir = RPM < 0;
   if (dir != leftDir) {
-    if (millis() - motorLeftDebounceTimestamp > 25) {
+    if (millis() - motorLeftDebounceTimestamp > 0) {
       digitalWrite(MOTOR_LEFT_DIR, dir);
       motorLeftDebounceTimestamp = millis();
 
@@ -198,12 +218,12 @@ void setMotorLeftRPM(float RPM) {
 unsigned long motorRightDebounceTimestamp = 0;
 bool rightDir = false;
 void setMotorRightRPM(float RPM) {
-  float absRPM = abs(RPM);
+  float absRPM = min(abs(RPM), 150);
   
   //DIRECTION
   bool dir = RPM > 0;
   if (dir != rightDir) {
-    if (millis() - motorRightDebounceTimestamp > 25) {
+    if (millis() - motorRightDebounceTimestamp > 0) {
       digitalWrite(MOTOR_RIGHT_DIR, dir);
       motorRightDebounceTimestamp = millis();
 
